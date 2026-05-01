@@ -195,6 +195,8 @@ def infer_product_area(issue: str, subject: str, company: str) -> str:
 
 def classify_request_type(issue: str, subject: str) -> str:
     text = f"{subject} {issue}".lower()
+    if any(w in text for w in ['ignore previous', 'system prompt', 'you are now']):
+        return 'invalid'
     if any(w in text for w in ['feature', 'wish', 'would be nice', 'suggestion', 'add support for']):
         return 'feature_request'
     if any(w in text for w in ['bug', 'broken', 'not working', 'error', 'crash', 'glitch', 'unexpected']):

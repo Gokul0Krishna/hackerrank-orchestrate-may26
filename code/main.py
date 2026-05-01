@@ -7,6 +7,10 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv(Path(__file__).parent.parent / '.env')
 
 from rich.console import Console
 from rich.live import Live
@@ -29,7 +33,6 @@ from agent import triage
 DEFAULT_INPUT  = Path(__file__).parent.parent / 'support_tickets' / 'support_tickets.csv'
 DEFAULT_OUTPUT = Path(__file__).parent.parent / 'support_tickets' / 'output.csv'
 OUTPUT_FIELDS  = [
-    'issue', 'subject', 'company',
     'status', 'product_area', 'response', 'justification', 'request_type'
 ]
 
