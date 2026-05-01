@@ -6,10 +6,37 @@ from openai import OpenAI
 
 log = logging.getLogger(__name__)
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-)
+class ClientManager:
+    def __init__(self):
+        self.keys = [
+            os.environ.get("OPENROUTER_API_KEY_1"),
+            os.environ.get("OPENROUTER_API_KEY_2")
+        ]
+        self.keys = [k for k in self.keys if k]
+        if not self.keys:
+            # Fallback to the original environment variable if numbered ones are missing
+            self.keys = [os.environ.get("OPENROUTER_API_KEY")]
+        
+        self.current_index = 0
+        self.has_switched = False
+        self.client = None
+        self._init_client()
+
+    def _init_client(self):
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.keys[self.current_index],
+        )
+
+    def rotate(self) -> bool:
+        if not self.has_switched and len(self.keys) > 1:
+            self.current_index = (self.current_index + 1) % len(self.keys)
+            self._init_client()
+            self.has_switched = True
+            return True
+        return False
+
+_manager = ClientManager()
 
 _retriever = None
 
@@ -179,13 +206,13 @@ def classify_request_type(issue: str, subject: str) -> str:
 # Step 1 — Retrieval evaluator (with prompt caching)
 # ---------------------------------------------------------------------------
 
-def evaluate_retrieval(ticket_text: str, corpus_block: str) -> tuple[str, dict]:
+def evaluate_retrieval(ticket_text: str, corpus_block: str, allow_rotation=True) -> tuple[str, dict]:
     """
     Returns (verdict, token_usage).
     verdict: SUFFICIENT | INSUFFICIENT | AMBIGUOUS
     """
     try:
-        stream = client.chat.completions.create(
+        stream = _manager.client.chat.completions.create(
             model='z-ai/glm-4.5-air:free',
             messages=[
                 {"role": "system", "content": EVALUATOR_SYSTEM},
@@ -217,6 +244,9 @@ def evaluate_retrieval(ticket_text: str, corpus_block: str) -> tuple[str, dict]:
         return verdict, usage
 
     except Exception as e:
+        if "429" in str(e) and allow_rotation and _manager.rotate():
+            log.info("Rate limit hit (429) in evaluator. Switching API key and retrying...")
+            return evaluate_retrieval(ticket_text, corpus_block, allow_rotation=False)
         log.error(f"Evaluator call failed: {e}")
         return 'AMBIGUOUS', {}
 
@@ -225,9 +255,9 @@ def evaluate_retrieval(ticket_text: str, corpus_block: str) -> tuple[str, dict]:
 # Step 1b — Query rewriter (for AMBIGUOUS)
 # ---------------------------------------------------------------------------
 
-def rewrite_query(ticket_text: str) -> str:
+def rewrite_query(ticket_text: str, allow_rotation=True) -> str:
     try:
-        stream = client.chat.completions.create(
+        stream = _manager.client.chat.completions.create(
             model='z-ai/glm-4.5-air:free',
             messages=[
                 {"role": "system", "content": "Rewrite this support ticket as a short, precise search query (max 12 words). Return only the query."},
@@ -244,6 +274,9 @@ def rewrite_query(ticket_text: str) -> str:
                 print(content, end="", flush=True)
         return full_content.strip()
     except Exception as e:
+        if "429" in str(e) and allow_rotation and _manager.rotate():
+            log.info("Rate limit hit (429) in rewriter. Switching API key and retrying...")
+            return rewrite_query(ticket_text, allow_rotation=False)
         log.warning(f"Query rewriter failed: {e}")
         return ticket_text
 
@@ -254,7 +287,8 @@ def rewrite_query(ticket_text: str) -> str:
 
 def generate_response(
     issue: str, subject: str, company: str,
-    corpus_block: str, urgency: str, retrieval_verdict: str
+    corpus_block: str, urgency: str, retrieval_verdict: str,
+    allow_rotation=True
 ) -> tuple[dict, dict]:
     """Returns (parsed_result, token_usage)."""
 
@@ -275,31 +309,41 @@ def generate_response(
         f"Return the JSON decision now."
     )
 
-    stream = client.chat.completions.create(
-        model='z-ai/glm-4.5-air:free',
-        messages=[
-            {"role": "system", "content": GENERATOR_SYSTEM},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0,
-        stream=True
-    )
+    try:
+        stream = _manager.client.chat.completions.create(
+            model='z-ai/glm-4.5-air:free',
+            messages=[
+                {"role": "system", "content": GENERATOR_SYSTEM},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0,
+            stream=True
+        )
 
-    full_content = ""
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            content = chunk.choices[0].delta.content
-            full_content += content
-            print(content, end="", flush=True)
+        full_content = ""
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_content += content
+                print(content, end="", flush=True)
 
-    usage = {} # Usage extraction from stream is complex in OpenAI SDK, keeping it empty
+        usage = {} # Usage extraction from stream is complex in OpenAI SDK, keeping it empty
 
-    raw = full_content.strip()
-    if raw.startswith('```'):
-        lines = raw.splitlines()
-        raw = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+        raw = full_content.strip()
+        if raw.startswith('```'):
+            lines = raw.splitlines()
+            raw = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
 
-    return json.loads(raw), usage
+        return json.loads(raw), usage
+
+    except Exception as e:
+        if "429" in str(e) and allow_rotation and _manager.rotate():
+            log.info("Rate limit hit (429) in generator. Switching API key and retrying...")
+            return generate_response(
+                issue, subject, company, corpus_block, urgency, retrieval_verdict,
+                allow_rotation=False
+            )
+        raise e
 
 
 # ---------------------------------------------------------------------------

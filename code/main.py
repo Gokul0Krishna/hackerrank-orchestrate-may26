@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import pandas as pd
 import os
 import sys
 import time
@@ -286,8 +287,8 @@ def run(input_path: Path, output_path: Path):
     audit_log.info(f"Output    : {output_path}")
     audit_log.info("=" * 72)
 
-    with open(input_path, newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f))
+    df = pd.read_csv(input_path).fillna('')
+    rows = df.to_dict('records')
 
     console.rule("[bold cyan]Support Triage Agent[/bold cyan]")
     console.print(
@@ -311,9 +312,10 @@ def run(input_path: Path, output_path: Path):
 
     with Live(console=console, refresh_per_second=4) as live:
         for i, row in enumerate(rows, 1):
-            issue   = row.get('issue',   '').strip()
-            subject = row.get('subject', '').strip()
-            company = row.get('company', 'None').strip() or 'None'
+            # Using user-provided logic for structured extraction
+            issue   = str(row.get('Issue') or row.get('issue') or '').strip()
+            subject = str(row.get('Subject') or row.get('subject') or '').strip()
+            company = str(row.get('Company') or row.get('company') or 'None').strip() or 'None'
 
             progress.update(
                 task_id,
@@ -334,13 +336,20 @@ def run(input_path: Path, output_path: Path):
             try:
                 result = triage(issue=issue, subject=subject, company=company)
             except Exception as e:
-                log.error(f"Row {i}: unhandled exception: {e}", exc_info=True)
+                err_msg = str(e)
+                if "429" in err_msg:
+                    log.error(f"Row {i}: Rate limit exceeded after attempting key rotation.")
+                    justification = "Rate limit exceeded on all available API keys."
+                else:
+                    log.error(f"Row {i}: unhandled exception: {e}", exc_info=True)
+                    justification = f"Unhandled agent error: {e}"
+                
                 error_count += 1
                 result = {
                     'status':       'escalated',
                     'product_area': 'unknown',
                     'response':     'We could not process your request. A human agent will follow up.',
-                    'justification': f'Unhandled agent error: {e}',
+                    'justification': justification,
                     'request_type': 'product_issue',
                     '_trace': {'input': {'issue': issue, 'subject': subject, 'company': company}},
                 }
@@ -384,10 +393,7 @@ def run(input_path: Path, output_path: Path):
 
     # Write output CSV (exclude internal keys)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(results)
+    pd.DataFrame(results)[OUTPUT_FIELDS].to_csv(output_path, index=False)
 
     elapsed = time.time() - start_time
     _print_final_summary(results, elapsed, token_totals, error_count, output_path)
