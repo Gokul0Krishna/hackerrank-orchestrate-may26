@@ -9,36 +9,46 @@ CORPUS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'corpus')
 os.makedirs(CORPUS_DIR, exist_ok=True)
 
 def scrape_hackerrank():
-    """
-    HackerRank uses a JSON API. 
-    Even with Playwright, it's more efficient to use the API directly.
-    """
-    import requests
+    """Use Playwright to fetch the JSON API to avoid 403/429 errors."""
     articles = []
     url = 'https://support.hackerrank.com/api/v2/help_center/en-us/articles.json?per_page=100'
-    headers = {'User-Agent': 'Mozilla/5.0 (compatible; SupportTriageBot/1.0)'}
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        while url:
+            try:
+                print(f"[HackerRank] Fetching API: {url}")
+                page.goto(url)
+                # Get the raw text from the page (which should be the JSON string)
+                content = page.locator("pre").inner_text() if page.locator("pre").is_visible() else page.content()
+                
+                # If Zendesk wraps JSON in HTML, BeautifulSoup can extract it
+                if "<html" in content.lower():
+                    soup = BeautifulSoup(content, 'html.parser')
+                    content = soup.get_text()
 
-    while url:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            data = resp.json()
-            for article in data.get('articles', []):
-                if article.get('body'):
-                    soup = BeautifulSoup(article['body'], 'html.parser')
-                    articles.append({
-                        'id': str(article['id']),
-                        'title': article.get('title', ''),
-                        'body': soup.get_text(separator=' ', strip=True),
-                        'url': article.get('html_url', ''),
-                        'source': 'hackerrank'
-                    })
-            url = data.get('next_page')
-        except Exception as e:
-            print(f" [HackerRank] Error: {e}")
-            break
-
+                data = json.loads(content)
+                
+                for article in data.get('articles', []):
+                    if article.get('body'):
+                        soup = BeautifulSoup(article['body'], 'html.parser')
+                        articles.append({
+                            'id': str(article['id']),
+                            'title': article.get('title', ''),
+                            'body': soup.get_text(separator=' ', strip=True),
+                            'url': article.get('html_url', ''),
+                            'source': 'hackerrank'
+                        })
+                
+                url = data.get('next_page')
+            except Exception as e:
+                print(f" [HackerRank] Stopped at {url}: {e}")
+                break
+        browser.close()
+    
     _save_json('hackerrank.json', articles)
-
 def scrape_with_playwright(source_name, base_url, seed_urls, domain_filter):
     """Generic Playwright crawler for Claude and Visa."""
     articles = []
@@ -89,7 +99,7 @@ def scrape_with_playwright(source_name, base_url, seed_urls, domain_filter):
                 
                 for href in hrefs:
                     if not href: continue
-                    full = urljoin(base_url, href)
+                    full = urljoin(base_url, href).split('#')[0]
                     parsed = urlparse(full)
                     
                     if (parsed.netloc == domain_filter and 
