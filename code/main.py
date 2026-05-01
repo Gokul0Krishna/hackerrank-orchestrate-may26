@@ -2,7 +2,22 @@ import csv
 import os
 import sys
 import time
+import logging
 from agent import triage
+from datetime import datetime
+
+LOG_PATH = os.path.join(os.path.expanduser('~'), 'hackerrank_orchestrate', 'log.txt')
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
 
 DEFAULT_INPUT = os.path.join(
     os.path.dirname(__file__), '..', 'support_tickets', 'support_tickets.csv'
@@ -18,8 +33,8 @@ def run(input_path: str, output_path: str):
     with open(input_path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
 
-    print(f"Processing {len(rows)} tickets from: {input_path}")
-    print(f"Output will be written to: {output_path}\n")
+    log.info(f"Processing {len(rows)} tickets from: {input_path}")
+    log.info(f"Output will be written to: {output_path}\n")
 
     results = []
 
@@ -29,12 +44,13 @@ def run(input_path: str, output_path: str):
         company = row.get('company', 'None').strip() or 'None'
 
         preview = (subject or issue)[:60]
-        print(f"[{i:>3}/{len(rows)}] {company} | {preview}...")
 
         try:
             result = triage(issue=issue, subject=subject, company=company)
+            log.info(f"[{i}/{len(rows)}] {company} | urgency={result.get('urgency','?')} | {preview}...")
+            log.info(f"  -> {result['status']} | {result['request_type']} | {result['product_area']}")
         except Exception as e:
-            print(f"         ERROR: {e}")
+            log.error(f"[{i}/{len(rows)}] Agent error: {e}")
             result = {
                 'status': 'escalated',
                 'product_area': 'unknown',
@@ -65,7 +81,7 @@ def run(input_path: str, output_path: str):
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\nDone. {len(results)} rows written to {output_path}")
+    log.info(f"\nDone. {len(results)} rows written to {output_path}")
 
 
 if __name__ == '__main__':
