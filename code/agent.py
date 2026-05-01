@@ -1,9 +1,12 @@
 import os
 import json
-import anthropic
+from openai import OpenAI
 from retriever import Retriever
 
-client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
+)
 _retriever = None
 
 
@@ -95,15 +98,33 @@ Relevant corpus excerpts:
 
 Return the JSON decision now."""
 
-    resp = client.messages.create(
-        model='claude-sonnet-4-20250514',
-        max_tokens=1000,
-        temperature=0,
-        system=SYSTEM_PROMPT,
-        messages=[{'role': 'user', 'content': user_message}]
+    # OpenRouter call with streaming as requested in the JS example
+    stream = client.chat.completions.create(
+        model="google/gemma-4-26b-a4b-it:free",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message}
+        ],
+        stream=True,
+        stream_options={"include_usage": True}
     )
 
-    raw = resp.content[0].text.strip()
+    raw = ""
+    for chunk in stream:
+        if chunk.choices and len(chunk.choices) > 0:
+            content = chunk.choices[0].delta.content
+            if content:
+                raw += content
+                # Optionally print streaming content to stdout
+                # print(content, end="", flush=True)
+
+        if hasattr(chunk, 'usage') and chunk.usage:
+            # Access reasoning tokens if available (specific to some models/OpenRouter)
+            reasoning = getattr(chunk.usage, 'reasoning_tokens', 0)
+            if reasoning:
+                print(f"\nReasoning tokens: {reasoning}")
+
+    raw = raw.strip()
 
     # Strip markdown fences if model wrapped output
     if raw.startswith('```'):
