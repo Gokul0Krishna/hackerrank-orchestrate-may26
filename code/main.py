@@ -1,16 +1,36 @@
+import csv
+import sys
+import time
+from openai import OpenAI
+from retriever import Retriever
+from datetime import datetime
 import os
 import json
 import logging
-import anthropic
-from retriever import Retriever
 
+# Configure logging for AGENTS.md compliance
+LOG_DIR = os.path.join(os.path.expanduser('~'), 'hackerrank_orchestrate')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, 'log.txt')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Client + retriever (singletons)
 # ---------------------------------------------------------------------------
 
-client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
+)
 _retriever = None
 
 
@@ -74,20 +94,19 @@ One word only."""
 def evaluate_retrieval(ticket_text: str, corpus_block: str) -> str:
     """Returns SUFFICIENT | INSUFFICIENT | AMBIGUOUS"""
     try:
-        resp = client.messages.create(
-            model='claude-sonnet-4-20250514',
+        resp = client.chat.completions.create(
+            model='google/gemma-4-26b-a4b-it:free',
             max_tokens=10,
             temperature=0,
-            system=EVALUATOR_SYSTEM,
-            messages=[{
-                'role': 'user',
-                'content': (
+            messages=[
+                {"role": "system", "content": EVALUATOR_SYSTEM},
+                {"role": "user", "content": (
                     f"Support ticket:\n{ticket_text}\n\n"
                     f"Retrieved corpus excerpts:\n{corpus_block}"
-                )
-            }]
+                )}
+            ]
         )
-        verdict = resp.content[0].text.strip().upper()
+        verdict = resp.choices[0].message.content.strip().upper()
         if verdict not in ('SUFFICIENT', 'INSUFFICIENT', 'AMBIGUOUS'):
             # Unexpected output — treat as ambiguous to be safe
             log.warning(f"Evaluator returned unexpected verdict: {verdict!r} — treating as AMBIGUOUS")
@@ -188,15 +207,30 @@ def generate_response(
         f"Return the JSON decision now."
     )
 
-    resp = client.messages.create(
-        model='claude-sonnet-4-20250514',
-        max_tokens=1000,
-        temperature=0,
-        system=GENERATOR_SYSTEM,
-        messages=[{'role': 'user', 'content': user_message}]
+    # OpenRouter call with streaming
+    stream = client.chat.completions.create(
+        model="google/gemma-4-26b-a4b-it:free",
+        messages=[
+            {"role": "system", "content": GENERATOR_SYSTEM},
+            {"role": "user", "content": user_message}
+        ],
+        stream=True,
+        stream_options={"include_usage": True}
     )
 
-    raw = resp.content[0].text.strip()
+    raw = ""
+    for chunk in stream:
+        if chunk.choices and len(chunk.choices) > 0:
+            content = chunk.choices[0].delta.content
+            if content:
+                raw += content
+
+        if hasattr(chunk, 'usage') and chunk.usage:
+            reasoning = getattr(chunk.usage, 'reasoning_tokens', 0)
+            if reasoning:
+                print(f"\nReasoning tokens: {reasoning}")
+
+    raw = raw.strip()
 
     # Strip markdown fences if present
     if raw.startswith('```'):
@@ -217,14 +251,16 @@ Return only the rewritten query — no explanation."""
 
 def rewrite_query(ticket_text: str) -> str:
     try:
-        resp = client.messages.create(
-            model='claude-sonnet-4-20250514',
+        resp = client.chat.completions.create(
+            model='google/gemma-4-26b-a4b-it:free',
             max_tokens=30,
             temperature=0,
-            system=REWRITER_SYSTEM,
-            messages=[{'role': 'user', 'content': ticket_text}]
+            messages=[
+                {"role": "system", "content": REWRITER_SYSTEM},
+                {"role": "user", "content": ticket_text}
+            ]
         )
-        return resp.content[0].text.strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
         log.warning(f"Query rewriter failed: {e}")
         return ticket_text
@@ -386,3 +422,67 @@ def classify_request_type(issue: str, subject: str) -> str:
     if any(w in text for w in ['how', 'what', 'when', 'where', 'can i', 'do you', 'is it possible']):
         return 'product_issue'
     return 'product_issue'
+
+# ---------------------------------------------------------------------------
+# Execution Loop
+# ---------------------------------------------------------------------------
+
+DEFAULT_INPUT = os.path.join(os.path.dirname(__file__), '..', 'support_tickets', 'support_tickets.csv')
+DEFAULT_OUTPUT = os.path.join(os.path.dirname(__file__), '..', 'support_tickets', 'output.csv')
+OUTPUT_FIELDS = ['issue', 'subject', 'company', 'status', 'product_area', 'response', 'justification', 'request_type']
+
+def run(input_path: str, output_path: str, limit: int = None):
+    with open(input_path, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+
+    if limit:
+        rows = rows[:limit]
+
+    log.info(f"Processing {len(rows)} tickets from: {input_path}")
+    log.info(f"Output will be written to: {output_path}\n")
+
+    results = []
+    for i, row in enumerate(rows, 1):
+        issue   = row.get('issue', '').strip()
+        subject = row.get('subject', '').strip()
+        company = row.get('company', 'None').strip() or 'None'
+
+        try:
+            result = triage(issue, subject, company)
+        except Exception as e:
+            log.error(f"[{i}/{len(rows)}] Agent error: {e}")
+            result = {
+                'status': 'escalated',
+                'product_area': 'general',
+                'response': "Error processing request.",
+                'justification': f"Internal error: {e}",
+                'request_type': 'product_issue'
+            }
+
+        results.append({
+            'issue': issue,
+            'subject': subject,
+            'company': company,
+            'status': result['status'],
+            'product_area': result['product_area'],
+            'response': result['response'],
+            'justification': result['justification'],
+            'request_type': result['request_type']
+        })
+        time.sleep(0.2)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+        writer.writerows(results)
+
+    log.info(f"\nDone. {len(results)} rows written to {output_path}")
+
+if __name__ == '__main__':
+    # Usage: python main.py [input.csv] [output.csv] [limit]
+    inp = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_INPUT
+    out = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUTPUT
+    lim = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    
+    run(inp, out, lim)
